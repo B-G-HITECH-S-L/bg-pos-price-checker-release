@@ -1,0 +1,287 @@
+#!/bin/bash
+# Compatible with the Bash 3.2 bundled with macOS.
+set -Eeuo pipefail
+
+REPO='B-G-HITECH-S-L/bg-pos-price-checker-release'
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+VERSION=''
+DRY_RUN=false
+KEEP_DRAFT=false
+RESUME=false
+WORK_DIR=''
+RELEASE_ID=''
+REMOTE_TOUCHED=false
+STAGE='检查参数'
+
+usage() {
+  cat <<'EOF'
+用法：scripts/release.sh v主版本.次版本.修订版本 [选项]
+
+输入：dist/<版本>/ 中恰好一个 .apk，以及非空的 release-notes.md。
+
+选项：
+  --dry-run  校验文件、登录及远程状态，展示计划；不修改远程
+  --draft    上传并校验后保留草稿
+  --resume   继续已有的同版本草稿；相同内容复用，冲突时停止
+  -h, --help 显示帮助
+
+默认行为：先建立草稿，上传并校验 APK，再发布为正式版并设为 Latest。
+目标仓库固定为 B-G-HITECH-S-L/bg-pos-price-checker-release。
+EOF
+}
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+on_exit() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    rm -rf -- "$WORK_DIR"
+  fi
+  if [[ $status -ne 0 ]]; then
+    printf '失败阶段：%s\n' "$STAGE" >&2
+    if [[ "$REMOTE_TOUCHED" == true ]]; then
+      printf '远程可能已完成部分操作，请先检查 Releases 页面；脚本不会自动删除草稿或附件。\n' >&2
+      printf '若仍为草稿，可重试：%q %q --resume' "$ROOT/scripts/release.sh" "$VERSION" >&2
+      if [[ "$KEEP_DRAFT" == true ]]; then printf ' --draft' >&2; fi
+      printf '\n' >&2
+    fi
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true ;;
+    --draft) KEEP_DRAFT=true ;;
+    --resume) RESUME=true ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "未知选项：$1" ;;
+    *)
+      [[ -z "$VERSION" ]] || die '只能指定一个版本号。'
+      VERSION=$1
+      ;;
+  esac
+  shift
+done
+
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+  die '版本号格式应为 v0.0.1，不接受路径、前导零或预发布后缀。'
+
+for dependency in gh git unzip shasum mktemp cp wc tr grep; do
+  command -v "$dependency" >/dev/null 2>&1 || die "缺少命令：$dependency"
+done
+
+# Pin all gh operations to GitHub.com, independent of the caller's GH_HOST/GH_REPO.
+export GH_HOST=github.com GH_PROMPT_DISABLED=1 GH_PAGER=cat
+
+STAGE='检查本地输入'
+ORIGIN=$(git -C "$ROOT" remote get-url origin) || die '无法读取仓库 origin。'
+case "$ORIGIN" in
+  "git@github.com:$REPO.git"|"https://github.com/$REPO.git"|"https://github.com/$REPO"|"ssh://git@github.com/$REPO.git") ;;
+  *) die "origin 与目标仓库不一致：$ORIGIN" ;;
+esac
+
+VERSION_DIR="$ROOT/dist/$VERSION"
+NOTES="$VERSION_DIR/release-notes.md"
+[[ -d "$VERSION_DIR" && ! -L "$ROOT/dist" && ! -L "$VERSION_DIR" ]] ||
+  die "版本目录不存在或是符号链接：$VERSION_DIR"
+
+shopt -s nullglob dotglob
+APK_FILES=("$VERSION_DIR"/*.apk)
+[[ ${#APK_FILES[@]} -eq 1 ]] ||
+  die "版本目录必须恰好包含一个 .apk 文件，当前找到 ${#APK_FILES[@]} 个。.textClipping 不是 APK。"
+APK=${APK_FILES[0]}
+[[ -f "$APK" && -s "$APK" && ! -L "$APK" ]] || die 'APK 必须是非空的普通文件，不能是符号链接。'
+[[ -f "$NOTES" && -s "$NOTES" && ! -L "$NOTES" ]] || die "请准备非空的发布说明：$NOTES"
+[[ -n "$(LC_ALL=C tr -d '[:space:]' < "$NOTES")" ]] || die '发布说明不能只有空白字符。'
+case "$APK" in
+  *'#'*|*$'\n'*|*$'\r'*|*$'\t'*) die 'APK 路径不能包含 #、换行或制表符；# 会被 gh 解释为附件标签。' ;;
+esac
+
+# Upload a stable snapshot if the source APK/notes change while the script runs.
+WORK_DIR=$(mktemp -d "$ROOT/dist/.release-$VERSION.XXXXXX")
+APK_NAME=${APK##*/}
+cp -- "$APK" "$WORK_DIR/$APK_NAME"
+cp -- "$NOTES" "$WORK_DIR/release-notes.md"
+APK="$WORK_DIR/$APK_NAME"
+NOTES="$WORK_DIR/release-notes.md"
+unzip -tqq "$APK" </dev/null || die 'APK 的 ZIP 完整性检查失败。'
+unzip -Z1 "$APK" | LC_ALL=C grep -Fx 'AndroidManifest.xml' >/dev/null ||
+  die 'APK 中缺少根目录 AndroidManifest.xml。'
+
+sha256() {
+  local result
+  result=$(shasum -a 256 < "$1") || return 1
+  printf '%s\n' "${result%% *}"
+}
+
+APK_SHA=$(sha256 "$APK")
+APK_SIZE=$(wc -c < "$APK" | tr -d '[:space:]')
+TITLE="BiG Price Checker $VERSION"
+
+api() { gh api --hostname github.com "$@"; }
+
+load_release() {
+  local record count=0
+  RELEASE_ID=''
+  RELEASE_DRAFT=''
+  RELEASE_URL=''
+  RELEASE_TARGET=''
+  # A successful, fully paginated list distinguishes absence from API/network errors,
+  # and includes drafts (which need not have a Git tag yet).
+  api "repos/$REPO/releases?per_page=100" --paginate --jq \
+    ".[] | select(.tag_name == \"$VERSION\") | [.id, .draft, .html_url, .target_commitish] | @tsv" \
+    > "$WORK_DIR/releases.tsv" || die '查询版本失败，不能将查询错误当作版本不存在。'
+  while IFS= read -r record; do
+    [[ -n "$record" ]] || continue
+    count=$((count + 1))
+    IFS=$'\t' read -r RELEASE_ID RELEASE_DRAFT RELEASE_URL RELEASE_TARGET <<< "$record"
+  done < "$WORK_DIR/releases.tsv"
+  [[ $count -le 1 ]] || die '发现多个同版本 Release，请先在 GitHub 核对草稿。'
+  if [[ $count -eq 1 ]]; then
+    [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || die '远程 Release ID 无效。'
+    [[ "$RELEASE_DRAFT" == true || "$RELEASE_DRAFT" == false ]] || die '无法确认远程草稿状态。'
+  fi
+}
+
+verify_assets() {
+  local id name size state digest url remote_sha
+  ASSET_COUNT=0
+  REMOTE_ASSET_NAME=''
+  DOWNLOAD_URL=''
+  api "repos/$REPO/releases/$RELEASE_ID/assets?per_page=100" --paginate --jq \
+    '.[] | [.id, .name, .size, .state, (.digest // "-"), .browser_download_url] | @tsv' \
+    > "$WORK_DIR/assets.tsv" || die '读取远程附件失败。'
+  while IFS=$'\t' read -r id name size state digest url; do
+    [[ -n "$id" ]] || continue
+    ASSET_COUNT=$((ASSET_COUNT + 1))
+    ASSET_ID=$id
+    REMOTE_ASSET_NAME=$name
+    REMOTE_ASSET_SIZE=$size
+    REMOTE_ASSET_STATE=$state
+    REMOTE_ASSET_DIGEST=$digest
+    DOWNLOAD_URL=$url
+  done < "$WORK_DIR/assets.tsv"
+  [[ $ASSET_COUNT -le 1 ]] || die '草稿含有多个附件，请先人工核对并清理多余附件；不会自动删除。'
+  [[ $ASSET_COUNT -eq 1 ]] || return 0
+  [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || die '远程附件 ID 无效。'
+  [[ "$REMOTE_ASSET_NAME" == *.apk ]] || die "草稿包含非 APK 附件：${REMOTE_ASSET_NAME}，请先人工核对。"
+  [[ "$REMOTE_ASSET_STATE" == uploaded && "$REMOTE_ASSET_SIZE" == "$APK_SIZE" ]] ||
+    die '远程附件未完整上传或大小与本地 APK 不同，请先人工核对。'
+  if [[ "$REMOTE_ASSET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    remote_sha=${REMOTE_ASSET_DIGEST#sha256:}
+  else
+    # Older assets may have no digest; compare the downloaded content instead.
+    api "repos/$REPO/releases/assets/$ASSET_ID" -H 'Accept: application/octet-stream' \
+      > "$WORK_DIR/remote-download" || die '下载既有附件进行内容校验失败。'
+    remote_sha=$(sha256 "$WORK_DIR/remote-download") || die '计算远程附件 SHA-256 失败。'
+  fi
+  [[ "$remote_sha" == "$APK_SHA" ]] || die '远程附件内容与本地 APK 不同；不会覆盖或发布。'
+}
+
+assert_draft() {
+  local record url draft prerelease tag
+  record=$(api "repos/$REPO/releases/$RELEASE_ID" --jq \
+    '[.html_url, .draft, .prerelease, .tag_name] | @tsv') || die '无法重新确认草稿状态。'
+  IFS=$'\t' read -r url draft prerelease tag <<< "$record"
+  [[ "$draft" == true && "$tag" == "$VERSION" ]] || die '版本已不再是本次草稿，停止修改。'
+}
+
+STAGE='检查 GitHub 登录和仓库权限'
+gh auth status --active --hostname github.com >/dev/null 2>&1 || die 'GitHub 登录无效，请先执行 gh auth login。'
+CAN_PUSH=$(api "repos/$REPO" --jq '.permissions.push // false') || die '无法访问目标仓库。'
+[[ "$CAN_PUSH" == true ]] || die '当前账号没有目标仓库的写入权限。'
+MAIN_SHA=$(api "repos/$REPO/git/ref/heads/main" --jq '.object.sha') || die '无法读取远程 main。'
+[[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || die '远程 main 的提交 SHA 无效。'
+
+STAGE='检查远程版本和附件'
+load_release
+ASSET_COUNT=0
+if [[ -n "$RELEASE_ID" ]]; then
+  [[ "$RELEASE_DRAFT" == true ]] || die "同版本已正式发布：$RELEASE_URL"
+  [[ "$RESUME" == true ]] || die '已有同版本草稿。核对附件后，添加 --resume 继续（预览也需要此选项）。'
+  verify_assets
+else
+  [[ "$RESUME" == false ]] || die '没有找到同版本草稿，不能使用 --resume。'
+  # --target does not move an existing tag. Reject one pointing away from main.
+  TAG_REF=$(api "repos/$REPO/git/matching-refs/tags/$VERSION" --jq \
+    ".[] | select(.ref == \"refs/tags/$VERSION\") | .ref") || die '检查远程标签失败。'
+  if [[ -n "$TAG_REF" ]]; then
+    TAG_SHA=$(api "repos/$REPO/commits/$VERSION" --jq '.sha') || die '无法解析已有标签的提交。'
+    [[ "$TAG_SHA" == "$MAIN_SHA" ]] || die '已有标签不指向本次远程 main 提交；不会移动标签。'
+  fi
+fi
+
+printf '仓库：%s\n版本：%s\nAPK：%s\n大小：%s bytes\nSHA-256：%s\n' \
+  "$REPO" "$VERSION" "$APK_NAME" "$APK_SIZE" "$APK_SHA"
+if [[ -n "$RELEASE_ID" ]]; then
+  printf '计划：续传草稿（目标：%s），核对并使用本地发布说明。\n' "$RELEASE_TARGET"
+else
+  printf '计划：从远程 main（%s）创建草稿。\n' "$MAIN_SHA"
+fi
+if [[ $ASSET_COUNT -eq 1 ]]; then
+  printf '附件：复用已校验的 %s。\n' "$REMOTE_ASSET_NAME"
+else
+  printf '附件：上传 %s 并校验。\n' "$APK_NAME"
+fi
+if [[ "$KEEP_DRAFT" == true ]]; then
+  printf '结果：保留草稿。\n'
+else
+  printf '结果：发布为正式版，并设为 Latest。\n'
+fi
+if [[ "$DRY_RUN" == true ]]; then
+  printf '预览完成，未修改远程。\n'
+  exit 0
+fi
+
+if [[ -z "$RELEASE_ID" ]]; then
+  STAGE='创建草稿'
+  REMOTE_TOUCHED=true
+  RELEASE_ID=$(api "repos/$REPO/releases" --method POST \
+    -f "tag_name=$VERSION" -f "target_commitish=$MAIN_SHA" -f "name=$TITLE" \
+    -F "body=@$NOTES" -F draft=true -F prerelease=false --jq '.id') || die '创建草稿失败，请检查远程是否已创建。'
+  [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || die '创建草稿后未获得有效 ID，请检查远程状态。'
+fi
+
+STAGE='上传 APK'
+# Re-read before writing in case another process changed the draft after preflight.
+assert_draft
+verify_assets
+if [[ $ASSET_COUNT -eq 0 ]]; then
+  REMOTE_TOUCHED=true
+  gh release upload "$VERSION" "$APK" --repo "$REPO" || die 'APK 上传失败，草稿已保留。'
+fi
+
+STAGE='校验远程 APK'
+verify_assets
+[[ $ASSET_COUNT -eq 1 ]] || die '上传后没有找到 APK，草稿未发布。'
+
+STAGE='更新发布说明'
+assert_draft
+REMOTE_TOUCHED=true
+api "repos/$REPO/releases/$RELEASE_ID" --method PATCH \
+  -f "name=$TITLE" -F "body=@$NOTES" -F prerelease=false --silent || die '更新草稿说明失败。'
+
+if [[ "$KEEP_DRAFT" == false ]]; then
+  STAGE='发布正式版'
+  api "repos/$REPO/releases/$RELEASE_ID" --method PATCH \
+    -F draft=false -F prerelease=false -f make_latest=true --silent || die '发布请求失败，请先检查远程是否已发布。'
+fi
+
+STAGE='核验发布结果'
+FINAL_RECORD=$(api "repos/$REPO/releases/$RELEASE_ID" --jq \
+  '[.html_url, .draft, .prerelease, .tag_name] | @tsv') || die '无法核验发布结果，请检查远程状态。'
+IFS=$'\t' read -r RELEASE_URL FINAL_DRAFT FINAL_PRERELEASE FINAL_TAG <<< "$FINAL_RECORD"
+[[ "$FINAL_DRAFT" == "$KEEP_DRAFT" && "$FINAL_PRERELEASE" == false && "$FINAL_TAG" == "$VERSION" ]] ||
+  die '远程发布状态与请求不一致，请检查 Releases 页面。'
+verify_assets
+[[ $ASSET_COUNT -eq 1 && -n "$RELEASE_URL" && -n "$DOWNLOAD_URL" ]] || die '发布后附件或链接不完整。'
+printf '\n完成。\nRelease：%s\n附件：%s\n下载：%s\nSHA-256：%s\n' \
+  "$RELEASE_URL" "$REMOTE_ASSET_NAME" "$DOWNLOAD_URL" "$APK_SHA"
