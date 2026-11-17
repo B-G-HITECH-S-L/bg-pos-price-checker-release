@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 REPO='B-G-HITECH-S-L/bg-pos-price-checker-release'
+AIO_REPO='B-G-HITECH-S-L/bg-pos-aio-release'
 ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 VERSION=''
 DRY_RUN=false
@@ -13,6 +14,7 @@ NOTES_TEMP=''
 MANIFEST_TEMP=''
 RELEASE_ID=''
 REMOTE_TOUCHED=false
+RELEASE_PUBLISHED=false
 STAGE='检查参数'
 
 usage() {
@@ -28,7 +30,7 @@ usage() {
   --resume   继续已有的同版本草稿；相同内容复用，冲突时停止
   -h, --help 显示帮助
 
-默认行为：先建立草稿，上传并校验 APK 与 update.json，再发布为正式版并设为 Latest。
+默认行为：校验 APK 与 update.json，正式发布为 Latest 后同步 AIO 应用目录。
 目标仓库固定为 B-G-HITECH-S-L/bg-pos-price-checker-release。
 EOF
 }
@@ -54,9 +56,14 @@ on_exit() {
     printf '失败阶段：%s\n' "$STAGE" >&2
     if [[ "$REMOTE_TOUCHED" == true ]]; then
       printf '远程可能已完成部分操作，请先检查 Releases 页面；脚本不会自动删除草稿或附件。\n' >&2
-      printf '若仍为草稿，可重试：%q %q --resume' "$ROOT/scripts/release.sh" "$VERSION" >&2
-      if [[ "$KEEP_DRAFT" == true ]]; then printf ' --draft' >&2; fi
-      printf '\n' >&2
+      if [[ "$RELEASE_PUBLISHED" == true ]]; then
+        printf 'Release 已正式发布；目录同步可单独重试：python3 %q %q\n' \
+          "$ROOT/scripts/sync-aio-catalog.py" "$VERSION" >&2
+      else
+        printf '若仍为草稿，可重试：%q %q --resume' "$ROOT/scripts/release.sh" "$VERSION" >&2
+        if [[ "$KEEP_DRAFT" == true ]]; then printf ' --draft' >&2; fi
+        printf '\n' >&2
+      fi
     fi
   fi
   exit "$status"
@@ -327,6 +334,10 @@ STAGE='检查 GitHub 登录和仓库权限'
 gh auth status --active --hostname github.com >/dev/null 2>&1 || die 'GitHub 登录无效，请先执行 gh auth login。'
 CAN_PUSH=$(api "repos/$REPO" --jq '.permissions.push // false') || die '无法访问目标仓库。'
 [[ "$CAN_PUSH" == true ]] || die '当前账号没有目标仓库的写入权限。'
+if [[ "$KEEP_DRAFT" == false ]]; then
+  AIO_CAN_PUSH=$(api "repos/$AIO_REPO" --jq '.permissions.push // false') || die '无法访问 AIO 应用目录仓库。'
+  [[ "$AIO_CAN_PUSH" == true ]] || die '当前账号没有 AIO 应用目录仓库的写入权限。'
+fi
 MAIN_SHA=$(api "repos/$REPO/git/ref/heads/main" --jq '.object.sha') || die '无法读取远程 main。'
 [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || die '远程 main 的提交 SHA 无效。'
 
@@ -362,7 +373,7 @@ printf '附件：big-price-checker.apk（已存在：%s）与 update.json（已�
 if [[ "$KEEP_DRAFT" == true ]]; then
   printf '结果：保留草稿。\n'
 else
-  printf '结果：发布为正式版，并设为 Latest。\n'
+  printf '结果：发布为正式版并设为 Latest，然后提交同步 AIO 应用目录。\n'
 fi
 if [[ "$DRY_RUN" == true ]]; then
   printf '\n发布说明预览：\n'
@@ -430,5 +441,11 @@ IFS=$'\t' read -r RELEASE_URL FINAL_DRAFT FINAL_PRERELEASE FINAL_TAG <<< "$FINAL
 verify_assets "$FINAL_DRAFT"
 [[ $ASSET_COUNT -eq 2 && "$APK_PRESENT" == true && "$MANIFEST_PRESENT" == true && -n "$RELEASE_URL" ]] ||
   die '发布后附件或链接不完整。'
+if [[ "$FINAL_DRAFT" == false ]]; then
+  RELEASE_PUBLISHED=true
+  STAGE='同步 AIO 应用目录'
+  python3 "$ROOT/scripts/sync-aio-catalog.py" "$VERSION" --manifest "$MANIFEST" ||
+    die 'Release 已发布，AIO 目录同步未完成；请使用独立同步命令恢复。'
+fi
 printf '\n完成。\nRelease：%s\n附件：%s 和 update.json\n下载：%s\nSHA-256：%s\n更新文件：%s\n' \
   "$RELEASE_URL" "$APK_NAME" "$DOWNLOAD_URL" "$APK_SHA" "$MANIFEST_URL"

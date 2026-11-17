@@ -53,7 +53,25 @@ dist/
 https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/latest/download/update.json
 ```
 
-客户端检查不调用 GitHub REST API，也不依赖 AIO 仓库。发布脚本仍使用已登录的 `gh` 管理 Release。旧版客户端和 AIO 应用管理仍可能读取 AIO 目录，迁移期间按需保留维护；新入口只改变新版查价机的自更新来源。首次发布使用新入口的客户端时，必须同时提供这两个附件。
+新版查价机检查更新不调用 GitHub REST API，也不读取 AIO 目录。AIO 应用管理和旧版查价机仍长期依赖 `bg-pos-aio-release/application/application-catalog.json`，因此每次正式发布都必须同步该文件；这不是仅在迁移期间执行的步骤。
+
+### 每次正式发布同步 AIO 应用目录
+
+正式 Release 的两个附件校验通过后，`release.sh` 自动执行 `scripts/sync-aio-catalog.py`，将同一份 `update.json` 的 `version`、`versionCode`、`packageUrl`、`sha256` 和 `size` 提交到 `B-G-HITECH-S-L/bg-pos-aio-release` 的 `main`，文件路径固定为 `application/application-catalog.json`。应用名称、多语言名称、图标、其他配置及其他应用记录保持原值。
+
+同步工具重新确认源版本为 Latest 正式版，核对已发布 APK 和更新附件的大小及 SHA-256。通过 GitHub Contents API 携带原文件 blob SHA 创建提交，目录并发变更会报错，不覆盖他人的修改。相同信息重复执行不产生新提交；更高构建号、同构建号但信息冲突、缺失或重复条目均会阻止更新。
+
+`--draft` 不修改 AIO 目录，也不要求 AIO 写权限。正式发布和默认 `--dry-run` 预览会提前检查两个仓库的写权限。目录同步失败时，已发布的 Release 保留，但脚本返回失败，不报告发布全部完成；修复权限或并发冲突后单独重试：
+
+```bash
+# 只读预览已发布版本对应的目录更新
+python3 scripts/sync-aio-catalog.py v0.1.23 --dry-run
+
+# 读取并验证正式 Release 附件，再提交目录；不重建、不重发 APK
+python3 scripts/sync-aio-catalog.py v0.1.23
+```
+
+独立同步命令只需要 Python 和已登录的 `gh`，不依赖本地 APK、Android SDK 或 AIO 仓库 checkout。若本地已有 AIO checkout，远程同步后可在工作区无冲突时执行 `git pull --ff-only` 获取提交。
 
 ### 自动维护安装包信息
 
@@ -82,7 +100,7 @@ https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/latest/d
 - Bash 3.2 或以上（兼容 macOS 自带 Bash）。
 - GitHub CLI `gh`、Python 3.8 或以上，以及系统工具 `git`、`unzip`、`shasum` 等。
 - Android SDK Build Tools 的 `aapt`。可通过 `AAPT_BIN` 指定可执行文件；否则从 PATH、`ANDROID_HOME`、`ANDROID_SDK_ROOT` 或 macOS/Linux 默认 SDK 目录查找。缺失时在访问 GitHub 前报错。
-- GitHub.com 当前登录账号具备本仓库写入权限。
+- GitHub.com 当前登录账号具备本发布仓库及 `B-G-HITECH-S-L/bg-pos-aio-release` 的写入权限；只准备草稿时仅需本仓库写权限。
 
 macOS 安装并登录：
 
@@ -121,7 +139,7 @@ gh auth status --active --hostname github.com
 新版本以运行时远程 `main` 的提交作为目标，先创建草稿，上传并校验 APK 和 `update.json` 后再正式发布。
 若同名标签已经存在，只有它指向该提交时才允许创建 Release；脚本不会移动标签。
 续传已有草稿时保留其目标和标签，标题与正文使用本次版本号及更新包信息后的发布说明。
-成功后输出 Release 地址、两个附件的下载地址及 APK SHA-256。
+正式发布还会提交同步 AIO 应用目录，全部成功后输出 Release 地址、两个附件的下载地址及 APK SHA-256。
 
 ## 重复执行与失败恢复
 
@@ -133,7 +151,8 @@ gh auth status --active --hostname github.com
 | 草稿只有 APK 或 `update.json`，内容与本地一致 | 复用已校验附件，仅补传缺失附件 |
 | 草稿两个附件均与本地一致 | 全部复用，不重复上传 |
 | 草稿任一附件内容或下载地址不同、上传未完成，或存在重复 / 额外附件 | 停止，需人工核对，不自动覆盖或删除 |
-| 同版本已正式发布 | 停止并输出已有 Release 地址 |
+| 同版本已正式发布 | 发布命令停止；若只需补同步目录，使用独立同步命令 |
+| Release 已发布但目录同步失败 | 返回失败，保留 Release；修复后独立重试目录同步，避免重复发包 |
 | 登录、权限或远程查询失败 | 报错，不把失败当成版本不存在 |
 | 上传、更新说明或发布请求失败 | 报告失败阶段，保留已完成的远程操作，提示恢复方式 |
 
@@ -155,4 +174,5 @@ python3 -B -m unittest discover -s tests -v
 
 参考：[GitHub CLI](https://cli.github.com/manual/gh_release_create)、
 [Release 附件及文件名规则](https://docs.github.com/en/rest/releases/assets)、
-[Latest 附件链接规则](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)。
+[Latest 附件链接规则](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)、
+[目录提交与 blob SHA](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents)。

@@ -73,7 +73,7 @@ headers = []
 i = 1
 while i < len(args):
     arg = args[i]
-    if arg in ("--hostname", "--method", "--jq", "-f", "-F", "-H"):
+    if arg in ("--hostname", "--method", "--jq", "-f", "-F", "-H", "--input"):
         value = args[i + 1]
         if arg == "--hostname":
             assert value == "github.com"
@@ -83,6 +83,9 @@ while i < len(args):
             query = value
         elif arg == "-H":
             headers.append(value)
+        elif arg == "--input":
+            assert value == "-"
+            fields.update(json.load(sys.stdin))
         else:
             key, content = value.split("=", 1)
             if arg == "-F" and content.startswith("@"):
@@ -97,6 +100,36 @@ while i < len(args):
         assert endpoint is None, args
         endpoint = arg
         i += 1
+
+aio_prefix = "repos/B-G-HITECH-S-L/bg-pos-aio-release"
+if endpoint.startswith(aio_prefix):
+    if endpoint == aio_prefix:
+        print(str(state.get("aio_can_push", True)).lower())
+    elif endpoint.split("?")[0] == aio_prefix + "/contents/application/application-catalog.json":
+        catalog = state.get("catalog", {"schemaVersion": 2, "applications": [{
+            "id": "com.byghitech.bg_pos_price_checker", "platform": "android",
+            "name": "Keep display name", "localizedNames": {"es": "Conservar nombre"},
+            "iconUrl": "https://example.com/icon.png", "version": "0.0.0", "versionCode": 1,
+            "packageFileName": "big-price-checker.apk", "packageUrl": "https://example.com/old.apk",
+            "sha256": "b" * 64, "size": 1,
+        }]})
+        if method == "PUT":
+            if state.get("catalog_sync_failure"):
+                fail("simulated catalog write failure")
+            if state.get("catalog_conflict") or fields["sha"] != state.get("catalog_sha", "b" * 40):
+                fail("HTTP 409 catalog changed concurrently")
+            assert fields["branch"] == "main"
+            state["catalog"] = json.loads(base64.b64decode(fields["content"]))
+            state["catalog_sha"] = "c" * 40
+            state.setdefault("catalog_commits", []).append(fields["message"])
+            save()
+            print(json.dumps({"commit": {"sha": "d" * 40}}))
+        else:
+            print(json.dumps({"type": "file", "encoding": "base64", "sha": state.get("catalog_sha", "b" * 40),
+                              "content": base64.b64encode(json.dumps(catalog).encode()).decode()}))
+    else:
+        fail("unhandled AIO endpoint: " + endpoint)
+    sys.exit(0)
 
 prefix = "repos/B-G-HITECH-S-L/bg-pos-price-checker-release"
 assert endpoint.startswith(prefix)
@@ -132,6 +165,13 @@ elif path == "/releases" and method == "POST":
     if state.get("create_response_lost"):
         fail("simulated lost create response")
     print(release["id"])
+elif path == "/releases/latest":
+    release = next((r for r in reversed(state["releases"]) if not r["draft"] and not r["prerelease"]), None)
+    if release is None:
+        fail("no published release")
+    print(json.dumps(release))
+elif path.startswith("/releases/tags/"):
+    print(json.dumps(release_for_tag(path.rsplit("/", 1)[1])))
 elif path.startswith("/releases/assets/"):
     assert "Accept: application/octet-stream" in headers
     asset_id = int(path.rsplit("/", 1)[1])

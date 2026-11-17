@@ -27,6 +27,7 @@ class ReleaseTests(unittest.TestCase):
         self.script = self.root / "scripts/release.sh"
         shutil.copy2(ROOT / "scripts/release.sh", self.script)
         shutil.copy2(ROOT / "scripts/generate-update-manifest.py", self.root / "scripts/generate-update-manifest.py")
+        shutil.copy2(ROOT / "scripts/sync-aio-catalog.py", self.root / "scripts/sync-aio-catalog.py")
         self.apk = self.version_dir / "big-price-checker.apk"
         with zipfile.ZipFile(self.apk, "w") as archive:
             archive.writestr("AndroidManifest.xml", b"fixture manifest")
@@ -605,6 +606,135 @@ class ReleaseTests(unittest.TestCase):
                 self.draft([dict(self.asset(), browser_download_url=url)])
                 self.assert_failure(self.run_release("--resume"), "版本下载地址不一致")
         self.assertEqual(self.mutations(), [])
+
+
+
+    def run_catalog_sync(self, *flags):
+        return subprocess.run([sys.executable, str(self.root / "scripts/sync-aio-catalog.py"),
+                               "v0.0.1", *flags], cwd=self.temp.name, env=self.env,
+                              capture_output=True, text=True, timeout=15)
+
+    def catalog_fixture(self, code=1):
+        return {"schemaVersion": 2, "applications": [{
+            "id": "com.byghitech.bg_pos_price_checker", "platform": "android",
+            "name": "原展示名称", "localizedNames": {"en": "Keep name", "es": "Conservar"},
+            "iconUrl": "https://example.com/keep.png", "extra": {"keep": True},
+            "version": "0.0.0", "versionCode": code, "packageFileName": "big-price-checker.apk",
+            "packageUrl": "https://example.com/old.apk", "sha256": "b" * 64, "size": 1,
+        }, {"id": "another.application", "platform": "android", "extra": "keep entire row"}]}
+
+    def test_formal_publication_updates_aio_catalog_and_preserves_display_fields(self):
+        original = self.catalog_fixture()
+        self.state["catalog"] = original
+        self.write_state()
+        self.assert_success(self.run_release())
+        state = self.read_state()
+        expected = json.loads(json.dumps(original))
+        metadata = json.loads(self.manifest_bytes())["applications"][0]
+        fields = ("version", "versionCode", "packageUrl", "sha256", "size")
+        expected["applications"][0].update({key: metadata[key] for key in fields})
+        self.assertEqual(state["catalog"], expected)
+        self.assertEqual(state["catalog_commits"], ["Update price checker to 0.0.1"])
+
+    def test_aio_write_permission_checked_before_formal_release(self):
+        self.state["aio_can_push"] = False
+        self.write_state()
+        self.assert_failure(self.run_release(), "没有 AIO 应用目录仓库的写入权限")
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.read_state()["releases"], [])
+
+    def test_draft_does_not_require_or_modify_aio_catalog(self):
+        self.state["aio_can_push"] = False
+        self.write_state()
+        self.assert_success(self.run_release("--draft"))
+        self.assertNotIn("catalog_commits", self.read_state())
+        self.assertFalse(any("bg-pos-aio-release" in a for call in self.calls() for a in call))
+
+    def test_catalog_failure_is_recoverable_without_republishing_release(self):
+        self.state["catalog_sync_failure"] = True
+        self.write_state()
+        result = self.run_release()
+        self.assert_failure(result, "AIO 目录同步未完成")
+        self.assertIn("sync-aio-catalog.py", result.stderr)
+        self.assertFalse(self.read_state()["releases"][0]["draft"])
+        self.assertNotIn("catalog_commits", self.state)
+        release_writes = sum(call[:2] == ["release", "upload"] or
+                             ("--method" in call and call[call.index("--method") + 1] in ("POST", "PATCH"))
+                             for call in self.calls())
+        self.state.pop("catalog_sync_failure")
+        self.write_state()
+        self.assert_success(self.run_catalog_sync())
+        self.assert_success(self.run_catalog_sync())
+        state = self.read_state()
+        self.assertEqual(len(state["catalog_commits"]), 1)
+        self.assertEqual(sum(call[:2] == ["release", "upload"] or
+                             ("--method" in call and call[call.index("--method") + 1] in ("POST", "PATCH"))
+                             for call in self.calls()), release_writes)
+
+    def test_catalog_dry_run_does_not_write_remote(self):
+        self.assert_success(self.run_release())
+        state = self.read_state()
+        state["catalog"] = self.catalog_fixture()
+        self.write_state()
+        count = len(self.mutations())
+        result = self.run_catalog_sync("--dry-run")
+        self.assert_success(result)
+        self.assertIn("未修改远程", result.stdout)
+        self.assertEqual(len(self.mutations()), count)
+        self.assertEqual(self.read_state()["catalog"], self.catalog_fixture())
+
+    def test_catalog_concurrent_edit_fails_without_lost_update(self):
+        self.state["catalog_conflict"] = True
+        self.write_state()
+        result = self.run_release()
+        self.assert_failure(result, "AIO 目录同步未完成")
+        self.assertIn("HTTP 409", result.stderr)
+        self.assertNotIn("catalog_commits", self.read_state())
+        self.state.pop("catalog_conflict")
+        self.write_state()
+        self.assert_success(self.run_catalog_sync())
+        self.assertEqual(len(self.read_state()["catalog_commits"]), 1)
+
+    def test_catalog_never_downgrades_or_overwrites_same_code_conflict(self):
+        self.assert_success(self.run_release())
+        self.read_state()
+        for code in (7, 8):
+            with self.subTest(code=code):
+                self.state["catalog"] = self.catalog_fixture(code=code)
+                self.write_state()
+                count = len(self.mutations())
+                self.assert_failure(self.run_catalog_sync(), "相同构建号" if code == 7 else "停止同步以免降级")
+                self.assertEqual(len(self.mutations()), count)
+                self.assertEqual(self.read_state()["catalog"], self.catalog_fixture(code=code))
+
+    def test_catalog_missing_or_duplicate_android_entry_is_not_recreated(self):
+        self.assert_success(self.run_release())
+        self.read_state()
+        for rows in ([], [self.catalog_fixture()["applications"][0]] * 2):
+            self.state["catalog"] = {"schemaVersion": 2, "applications": rows}
+            self.write_state()
+            count = len(self.mutations())
+            self.assert_failure(self.run_catalog_sync(), "唯一的 Android 查价机条目")
+            self.assertEqual(len(self.mutations()), count)
+
+    def test_catalog_rejects_draft_and_non_latest_release(self):
+        self.assert_success(self.run_release("--draft"))
+        self.assert_failure(self.run_catalog_sync(), "仅允许同步已正式发布")
+        self.assert_success(self.run_release("--resume"))
+        newer = dict(self.read_state()["releases"][0], id=2, tag_name="v0.0.2")
+        self.state["releases"].append(newer)
+        self.write_state()
+        count = len(self.mutations())
+        self.assert_failure(self.run_catalog_sync(), "不是 Latest Release")
+        self.assertEqual(len(self.mutations()), count)
+
+    def test_catalog_rejects_unverified_published_apk(self):
+        self.assert_success(self.run_release())
+        self.read_state()["releases"][0]["assets"][0]["digest"] = "sha256:" + "f" * 64
+        self.write_state()
+        count = len(self.mutations())
+        self.assert_failure(self.run_catalog_sync(), "APK SHA-256 与 update.json 不一致")
+        self.assertEqual(len(self.mutations()), count)
 
 
 if __name__ == "__main__":
