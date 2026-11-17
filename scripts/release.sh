@@ -264,7 +264,8 @@ load_release() {
 }
 
 verify_assets() {
-  local id name size state digest url remote_sha expected_sha expected_size
+  local id name size state digest url remote_sha expected_sha expected_size temporary_tag
+  local allow_draft_urls=${1:-false}
   ASSET_COUNT=0
   APK_PRESENT=false
   MANIFEST_PRESENT=false
@@ -294,8 +295,15 @@ verify_assets() {
     esac
     [[ "$state" == uploaded ]] || die "远程附件 ${name} 未完整上传，请先人工核对。"
     [[ "$size" == "$expected_size" ]] || die "远程附件 ${name} 大小与本地不同，请先人工核对。"
-    [[ "$url" == "https://github.com/$REPO/releases/download/$VERSION/${name}" ]] ||
-      die "远程附件 ${name} 的版本下载地址不一致。"
+    if [[ "$url" != "https://github.com/$REPO/releases/download/$VERSION/${name}" ]]; then
+      # GitHub serves draft assets under an untagged-* URL until publication.
+      # Only draft checks may accept that temporary tag, in this exact repo.
+      temporary_tag=${url#"https://github.com/$REPO/releases/download/"}
+      temporary_tag=${temporary_tag%"/${name}"}
+      [[ "$allow_draft_urls" == true && "$temporary_tag" =~ ^untagged-[0-9a-f]+$ &&
+         "$url" == "https://github.com/$REPO/releases/download/$temporary_tag/${name}" ]] ||
+        die "远程附件 ${name} 的版本下载地址不一致。"
+    fi
     if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
       remote_sha=${digest#sha256:}
     else
@@ -330,7 +338,7 @@ MANIFEST_PRESENT=false
 if [[ -n "$RELEASE_ID" ]]; then
   [[ "$RELEASE_DRAFT" == true ]] || die "同版本已正式发布：$RELEASE_URL"
   [[ "$RESUME" == true ]] || die '已有同版本草稿。核对附件后，添加 --resume 继续（预览也需要此选项）。'
-  verify_assets
+  verify_assets true
 else
   [[ "$RESUME" == false ]] || die '没有找到同版本草稿，不能使用 --resume。'
   # --target does not move an existing tag. Reject one pointing away from main.
@@ -381,21 +389,21 @@ fi
 STAGE='上传 APK'
 # Re-read before writing in case another process changed the draft after preflight.
 assert_draft
-verify_assets
+verify_assets true
 if [[ "$APK_PRESENT" == false ]]; then
   REMOTE_TOUCHED=true
   gh release upload "$VERSION" "$APK" --repo "$REPO" || die 'APK 上传失败，草稿已保留。'
 fi
 
 STAGE='上传更新文件'
-verify_assets
+verify_assets true
 if [[ "$MANIFEST_PRESENT" == false ]]; then
   REMOTE_TOUCHED=true
   gh release upload "$VERSION" "$MANIFEST" --repo "$REPO" || die 'update.json 上传失败，草稿已保留。'
 fi
 
 STAGE='校验远程 APK 和更新文件'
-verify_assets
+verify_assets true
 [[ $ASSET_COUNT -eq 2 && "$APK_PRESENT" == true && "$MANIFEST_PRESENT" == true ]] ||
   die '上传后 APK 或 update.json 不完整，草稿未发布。'
 
@@ -419,7 +427,7 @@ FINAL_RECORD=$(api "repos/$REPO/releases/$RELEASE_ID" --jq \
 IFS=$'\t' read -r RELEASE_URL FINAL_DRAFT FINAL_PRERELEASE FINAL_TAG <<< "$FINAL_RECORD"
 [[ "$FINAL_DRAFT" == "$KEEP_DRAFT" && "$FINAL_PRERELEASE" == false && "$FINAL_TAG" == "$VERSION" ]] ||
   die '远程发布状态与请求不一致，请检查 Releases 页面。'
-verify_assets
+verify_assets "$FINAL_DRAFT"
 [[ $ASSET_COUNT -eq 2 && "$APK_PRESENT" == true && "$MANIFEST_PRESENT" == true && -n "$RELEASE_URL" ]] ||
   die '发布后附件或链接不完整。'
 printf '\n完成。\nRelease：%s\n附件：%s 和 update.json\n下载：%s\nSHA-256：%s\n更新文件：%s\n' \

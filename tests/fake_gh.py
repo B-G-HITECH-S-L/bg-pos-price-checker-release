@@ -39,6 +39,7 @@ def asset_for_file(path):
     data = Path(path).read_bytes()
     if state.get("corrupt_upload") in (True, Path(path).name):
         data = data[:-1] + bytes([data[-1] ^ 1])
+    url_tag = "untagged-9b8f76b2b9a107748ab2" if release_for_tag(args[2])["draft"] else args[2]
     return {
         "id": 12 if Path(path).name == "update.json" else 11,
         "name": Path(path).name,
@@ -46,7 +47,7 @@ def asset_for_file(path):
         "state": "uploaded",
         "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
         "data": base64.b64encode(data).decode(),
-        "browser_download_url": "https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/download/" + args[2] + "/" + Path(path).name,
+        "browser_download_url": "https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/download/" + url_tag + "/" + Path(path).name,
     }
 
 
@@ -149,6 +150,10 @@ elif path.startswith("/releases/"):
         if release["draft"] and "tag_name" not in fields:
             release["tag_name"] = "untagged-test-placeholder"
         release.update(fields)
+        if fields.get("draft") is False and not state.get("retain_draft_asset_urls"):
+            for asset in release["assets"]:
+                asset["browser_download_url"] = ("https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/download/"
+                                                 + release["tag_name"] + "/" + asset["name"])
         save()
         if fields.get("draft") is False and state.get("publish_response_lost"):
             fail("simulated lost publish response")

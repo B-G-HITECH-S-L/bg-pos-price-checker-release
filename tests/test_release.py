@@ -573,5 +573,39 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.mutations(), [])
 
 
+
+    def test_real_github_draft_asset_urls_are_promoted_on_publication(self):
+        self.assert_success(self.run_release("--draft"))
+        draft = self.read_state()["releases"][0]
+        self.assertTrue(all("/untagged-" in a["browser_download_url"] for a in draft["assets"]))
+        self.assert_success(self.run_release("--resume", "--dry-run"))
+        self.assert_success(self.run_release("--resume"))
+        release = self.read_state()["releases"][0]
+        self.assertFalse(release["draft"])
+        for asset in release["assets"]:
+            self.assertEqual(asset["browser_download_url"], f"https://github.com/{REPO}/releases/download/v0.0.1/{asset['name']}")
+        self.assertEqual(sum(a[:2] == ["release", "upload"] for a in self.calls()), 2)
+
+    def test_formal_release_cannot_keep_temporary_asset_urls(self):
+        self.state["retain_draft_asset_urls"] = True
+        self.write_state()
+        self.assert_failure(self.run_release(), "版本下载地址不一致")
+        self.assertFalse(self.read_state()["releases"][0]["draft"])
+
+    def test_draft_temporary_url_requires_exact_repository_tag_and_filename(self):
+        urls = [
+            f"https://github.com/other/repo/releases/download/untagged-abc123/big-price-checker.apk",
+            f"https://github.com/{REPO}/releases/download/v0.0.2/big-price-checker.apk",
+            f"https://github.com/{REPO}/releases/download/untagged-invalid/big-price-checker.apk",
+            f"https://github.com/{REPO}/releases/download/untagged-abc123/other.apk",
+            f"https://github.com/{REPO}/releases/download/untagged-abc123/big-price-checker.apk?x=1",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                self.draft([dict(self.asset(), browser_download_url=url)])
+                self.assert_failure(self.run_release("--resume"), "版本下载地址不一致")
+        self.assertEqual(self.mutations(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
