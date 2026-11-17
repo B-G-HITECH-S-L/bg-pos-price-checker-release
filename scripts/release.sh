@@ -9,6 +9,8 @@ DRY_RUN=false
 KEEP_DRAFT=false
 RESUME=false
 WORK_DIR=''
+NOTES_TEMP=''
+MANIFEST_TEMP=''
 RELEASE_ID=''
 REMOTE_TOUCHED=false
 STAGE='检查参数'
@@ -17,15 +19,16 @@ usage() {
   cat <<'EOF'
 用法：scripts/release.sh v主版本.次版本.修订版本 [选项]
 
-输入：dist/<版本>/ 中恰好一个 .apk，以及非空的 release-notes.md。
+输入：dist/<版本>/ 中恰好一个 .apk；release-notes.md 缺失或为空时自动生成。
+从实际 APK 生成 update.json；说明中自动维护 SHA-256 和 Size，已有人工正文保留。
 
 选项：
-  --dry-run  校验文件、登录及远程状态，展示计划；不修改远程
+  --dry-run  校验并预览更新文件及发布说明；不修改本地文件或远程
   --draft    上传并校验后保留草稿
   --resume   继续已有的同版本草稿；相同内容复用，冲突时停止
   -h, --help 显示帮助
 
-默认行为：先建立草稿，上传并校验 APK，再发布为正式版并设为 Latest。
+默认行为：先建立草稿，上传并校验 APK 与 update.json，再发布为正式版并设为 Latest。
 目标仓库固定为 B-G-HITECH-S-L/bg-pos-price-checker-release。
 EOF
 }
@@ -38,6 +41,12 @@ die() {
 on_exit() {
   local status=$?
   trap - EXIT
+  if [[ -n "$NOTES_TEMP" && -f "$NOTES_TEMP" ]]; then
+    rm -f -- "$NOTES_TEMP"
+  fi
+  if [[ -n "$MANIFEST_TEMP" && -f "$MANIFEST_TEMP" ]]; then
+    rm -f -- "$MANIFEST_TEMP"
+  fi
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
     rm -rf -- "$WORK_DIR"
   fi
@@ -74,7 +83,7 @@ done
 [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
   die '版本号格式应为 v0.0.1，不接受路径、前导零或预发布后缀。'
 
-for dependency in gh git unzip shasum mktemp cp wc tr grep; do
+for dependency in gh git unzip shasum mktemp cp mv cmp awk wc tr grep python3; do
   command -v "$dependency" >/dev/null 2>&1 || die "缺少命令：$dependency"
 done
 
@@ -89,7 +98,10 @@ case "$ORIGIN" in
 esac
 
 VERSION_DIR="$ROOT/dist/$VERSION"
-NOTES="$VERSION_DIR/release-notes.md"
+SOURCE_NOTES="$VERSION_DIR/release-notes.md"
+NOTES_EXISTED=false
+SOURCE_MANIFEST="$VERSION_DIR/update.json"
+MANIFEST_EXISTED=false
 [[ -d "$VERSION_DIR" && ! -L "$ROOT/dist" && ! -L "$VERSION_DIR" ]] ||
   die "版本目录不存在或是符号链接：$VERSION_DIR"
 
@@ -99,8 +111,14 @@ APK_FILES=("$VERSION_DIR"/*.apk)
   die "版本目录必须恰好包含一个 .apk 文件，当前找到 ${#APK_FILES[@]} 个。.textClipping 不是 APK。"
 APK=${APK_FILES[0]}
 [[ -f "$APK" && -s "$APK" && ! -L "$APK" ]] || die 'APK 必须是非空的普通文件，不能是符号链接。'
-[[ -f "$NOTES" && -s "$NOTES" && ! -L "$NOTES" ]] || die "请准备非空的发布说明：$NOTES"
-[[ -n "$(LC_ALL=C tr -d '[:space:]' < "$NOTES")" ]] || die '发布说明不能只有空白字符。'
+if [[ -e "$SOURCE_MANIFEST" || -L "$SOURCE_MANIFEST" ]]; then
+  [[ -f "$SOURCE_MANIFEST" && ! -L "$SOURCE_MANIFEST" ]] || die 'update.json 必须是普通文件，不能是目录或符号链接。'
+  MANIFEST_EXISTED=true
+fi
+if [[ -e "$SOURCE_NOTES" || -L "$SOURCE_NOTES" ]]; then
+  [[ -f "$SOURCE_NOTES" && ! -L "$SOURCE_NOTES" ]] || die '发布说明必须是普通文件，不能是目录或符号链接。'
+  NOTES_EXISTED=true
+fi
 case "$APK" in
   *'#'*|*$'\n'*|*$'\r'*|*$'\t'*) die 'APK 路径不能包含 #、换行或制表符；# 会被 gh 解释为附件标签。' ;;
 esac
@@ -108,8 +126,16 @@ esac
 # Upload a stable snapshot if the source APK/notes change while the script runs.
 WORK_DIR=$(mktemp -d "$ROOT/dist/.release-$VERSION.XXXXXX")
 APK_NAME=${APK##*/}
+[[ "$APK_NAME" == big-price-checker.apk ]] || die 'APK 文件名必须为 big-price-checker.apk，与应用安装校验保持一致。'
+if [[ "$MANIFEST_EXISTED" == true ]]; then
+  cp -- "$SOURCE_MANIFEST" "$WORK_DIR/manifest-original.json"
+fi
 cp -- "$APK" "$WORK_DIR/$APK_NAME"
-cp -- "$NOTES" "$WORK_DIR/release-notes.md"
+if [[ "$NOTES_EXISTED" == true ]]; then
+  cp -- "$SOURCE_NOTES" "$WORK_DIR/notes-original.md"
+else
+  : > "$WORK_DIR/notes-original.md"
+fi
 APK="$WORK_DIR/$APK_NAME"
 NOTES="$WORK_DIR/release-notes.md"
 unzip -tqq "$APK" </dev/null || die 'APK 的 ZIP 完整性检查失败。'
@@ -125,6 +151,92 @@ sha256() {
 APK_SHA=$(sha256 "$APK")
 APK_SIZE=$(wc -c < "$APK" | tr -d '[:space:]')
 TITLE="BiG Price Checker $VERSION"
+
+STAGE='生成更新文件'
+MANIFEST="$WORK_DIR/update.json"
+python3 "$ROOT/scripts/generate-update-manifest.py" --apk "$APK" --version "$VERSION" --output "$MANIFEST" ||
+  die '生成 update.json 失败；请核对 APK 包名、版本、构建号和 Android SDK aapt。'
+MANIFEST_SHA=$(sha256 "$MANIFEST")
+MANIFEST_SIZE=$(wc -c < "$MANIFEST" | tr -d '[:space:]')
+
+STAGE='生成发布说明'
+# Keep the original snapshot separate so a later write can detect manual edits.
+if [[ -n "$(LC_ALL=C tr -d '[:space:]' < "$WORK_DIR/notes-original.md")" ]]; then
+  cp -- "$WORK_DIR/notes-original.md" "$WORK_DIR/notes-input.md"
+else
+  printf '# %s\n' "$TITLE" > "$WORK_DIR/notes-input.md"
+fi
+{
+  printf '%s\n' '<!-- release-package-info:start -->' '## 安装包信息' ''
+  printf '%s\n' "- 文件名: $APK_NAME" "- SHA-256: $APK_SHA" "- Size: $APK_SIZE"
+  printf '%s\n' '<!-- release-package-info:end -->'
+} > "$WORK_DIR/package-info.md"
+
+# Replace only the marked block, in place. Reject malformed/duplicate markers
+# rather than accidentally discarding handwritten release notes.
+awk '
+  NR == FNR { block[++count] = $0; next }
+  {
+    marker = $0
+    sub(/\r$/, "", marker)
+    if (marker == "<!-- release-package-info:start -->") {
+      if (inside || seen) { invalid = 1; exit 1 }
+      inside = seen = 1
+      for (i = 1; i <= count; i++) print block[i]
+      next
+    }
+    if (marker == "<!-- release-package-info:end -->") {
+      if (!inside) { invalid = 1; exit 1 }
+      inside = 0
+      next
+    }
+    if (!inside) print
+  }
+  END {
+    if (invalid || inside) exit 1
+    if (!seen) {
+      print ""
+      for (i = 1; i <= count; i++) print block[i]
+    }
+  }
+' "$WORK_DIR/package-info.md" "$WORK_DIR/notes-input.md" > "$NOTES" ||
+  die '发布说明的自动区块标记不完整或重复，请先修复 release-package-info 标记。'
+
+persist_notes() {
+  # Do not overwrite edits made during network preflight, or a newly created file.
+  if [[ "$NOTES_EXISTED" == true ]]; then
+    [[ -f "$SOURCE_NOTES" && ! -L "$SOURCE_NOTES" ]] &&
+      cmp -s "$SOURCE_NOTES" "$WORK_DIR/notes-original.md" ||
+      die '发布说明在执行期间发生变化，请核对后重新运行。'
+    if cmp -s "$SOURCE_NOTES" "$NOTES"; then return 0; fi
+  else
+    [[ ! -e "$SOURCE_NOTES" && ! -L "$SOURCE_NOTES" ]] ||
+      die '执行期间已出现新的发布说明，请核对后重新运行。'
+  fi
+  # The replacement is on the same filesystem, so readers never see a partial file.
+  NOTES_TEMP=$(mktemp "$VERSION_DIR/.release-notes.XXXXXX")
+  cp -- "$NOTES" "$NOTES_TEMP"
+  mv -f -- "$NOTES_TEMP" "$SOURCE_NOTES"
+  NOTES_TEMP=''
+  printf '本地发布说明已更新：%s\n' "$SOURCE_NOTES"
+}
+
+persist_manifest() {
+  if [[ "$MANIFEST_EXISTED" == true ]]; then
+    [[ -f "$SOURCE_MANIFEST" && ! -L "$SOURCE_MANIFEST" ]] &&
+      cmp -s "$SOURCE_MANIFEST" "$WORK_DIR/manifest-original.json" ||
+      die 'update.json 在执行期间发生变化，请核对后重新运行。'
+    if cmp -s "$SOURCE_MANIFEST" "$MANIFEST"; then return 0; fi
+  else
+    [[ ! -e "$SOURCE_MANIFEST" && ! -L "$SOURCE_MANIFEST" ]] ||
+      die '执行期间已出现新的 update.json，请核对后重新运行。'
+  fi
+  MANIFEST_TEMP=$(mktemp "$VERSION_DIR/.update.XXXXXX")
+  cp -- "$MANIFEST" "$MANIFEST_TEMP"
+  mv -f -- "$MANIFEST_TEMP" "$SOURCE_MANIFEST"
+  MANIFEST_TEMP=''
+  printf '本地更新文件已生成：%s\n' "$SOURCE_MANIFEST"
+}
 
 api() { gh api --hostname github.com "$@"; }
 
@@ -152,38 +264,47 @@ load_release() {
 }
 
 verify_assets() {
-  local id name size state digest url remote_sha
+  local id name size state digest url remote_sha expected_sha expected_size
   ASSET_COUNT=0
-  REMOTE_ASSET_NAME=''
+  APK_PRESENT=false
+  MANIFEST_PRESENT=false
   DOWNLOAD_URL=''
+  MANIFEST_URL=''
   api "repos/$REPO/releases/$RELEASE_ID/assets?per_page=100" --paginate --jq \
     '.[] | [.id, .name, .size, .state, (.digest // "-"), .browser_download_url] | @tsv' \
     > "$WORK_DIR/assets.tsv" || die '读取远程附件失败。'
   while IFS=$'\t' read -r id name size state digest url; do
     [[ -n "$id" ]] || continue
     ASSET_COUNT=$((ASSET_COUNT + 1))
-    ASSET_ID=$id
-    REMOTE_ASSET_NAME=$name
-    REMOTE_ASSET_SIZE=$size
-    REMOTE_ASSET_STATE=$state
-    REMOTE_ASSET_DIGEST=$digest
-    DOWNLOAD_URL=$url
+    [[ "$id" =~ ^[0-9]+$ ]] || die '远程附件 ID 无效。'
+    case "${name}" in
+      big-price-checker.apk)
+        [[ "$APK_PRESENT" == false ]] || die '草稿含有多个附件同名 APK；不会自动删除。'
+        APK_PRESENT=true
+        expected_sha=$APK_SHA; expected_size=$APK_SIZE
+        DOWNLOAD_URL=$url
+        ;;
+      update.json)
+        [[ "$MANIFEST_PRESENT" == false ]] || die '草稿含有多个附件同名 update.json；不会自动删除。'
+        MANIFEST_PRESENT=true
+        expected_sha=$MANIFEST_SHA; expected_size=$MANIFEST_SIZE
+        MANIFEST_URL=$url
+        ;;
+      *) die "草稿包含不支持的附件：${name}，请先人工核对；不会自动删除。" ;;
+    esac
+    [[ "$state" == uploaded ]] || die "远程附件 ${name} 未完整上传，请先人工核对。"
+    [[ "$size" == "$expected_size" ]] || die "远程附件 ${name} 大小与本地不同，请先人工核对。"
+    [[ "$url" == "https://github.com/$REPO/releases/download/$VERSION/${name}" ]] ||
+      die "远程附件 ${name} 的版本下载地址不一致。"
+    if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      remote_sha=${digest#sha256:}
+    else
+      api "repos/$REPO/releases/assets/$id" -H 'Accept: application/octet-stream' \
+        > "$WORK_DIR/remote-download-$id" || die "下载附件 ${name} 进行内容校验失败。"
+      remote_sha=$(sha256 "$WORK_DIR/remote-download-$id") || die '计算远程附件 SHA-256 失败。'
+    fi
+    [[ "$remote_sha" == "$expected_sha" ]] || die "远程附件内容与本地 ${name} 不同；不会覆盖或发布。"
   done < "$WORK_DIR/assets.tsv"
-  [[ $ASSET_COUNT -le 1 ]] || die '草稿含有多个附件，请先人工核对并清理多余附件；不会自动删除。'
-  [[ $ASSET_COUNT -eq 1 ]] || return 0
-  [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || die '远程附件 ID 无效。'
-  [[ "$REMOTE_ASSET_NAME" == *.apk ]] || die "草稿包含非 APK 附件：${REMOTE_ASSET_NAME}，请先人工核对。"
-  [[ "$REMOTE_ASSET_STATE" == uploaded && "$REMOTE_ASSET_SIZE" == "$APK_SIZE" ]] ||
-    die '远程附件未完整上传或大小与本地 APK 不同，请先人工核对。'
-  if [[ "$REMOTE_ASSET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    remote_sha=${REMOTE_ASSET_DIGEST#sha256:}
-  else
-    # Older assets may have no digest; compare the downloaded content instead.
-    api "repos/$REPO/releases/assets/$ASSET_ID" -H 'Accept: application/octet-stream' \
-      > "$WORK_DIR/remote-download" || die '下载既有附件进行内容校验失败。'
-    remote_sha=$(sha256 "$WORK_DIR/remote-download") || die '计算远程附件 SHA-256 失败。'
-  fi
-  [[ "$remote_sha" == "$APK_SHA" ]] || die '远程附件内容与本地 APK 不同；不会覆盖或发布。'
 }
 
 assert_draft() {
@@ -204,6 +325,8 @@ MAIN_SHA=$(api "repos/$REPO/git/ref/heads/main" --jq '.object.sha') || die '无�
 STAGE='检查远程版本和附件'
 load_release
 ASSET_COUNT=0
+APK_PRESENT=false
+MANIFEST_PRESENT=false
 if [[ -n "$RELEASE_ID" ]]; then
   [[ "$RELEASE_DRAFT" == true ]] || die "同版本已正式发布：$RELEASE_URL"
   [[ "$RESUME" == true ]] || die '已有同版本草稿。核对附件后，添加 --resume 继续（预览也需要此选项）。'
@@ -219,27 +342,32 @@ else
   fi
 fi
 
-printf '仓库：%s\n版本：%s\nAPK：%s\n大小：%s bytes\nSHA-256：%s\n' \
+printf '仓库：%s\n版本：%s\nAPK：%s\nSize: %s bytes\nSHA-256：%s\n' \
   "$REPO" "$VERSION" "$APK_NAME" "$APK_SIZE" "$APK_SHA"
 if [[ -n "$RELEASE_ID" ]]; then
   printf '计划：续传草稿（目标：%s），核对并使用本地发布说明。\n' "$RELEASE_TARGET"
 else
   printf '计划：从远程 main（%s）创建草稿。\n' "$MAIN_SHA"
 fi
-if [[ $ASSET_COUNT -eq 1 ]]; then
-  printf '附件：复用已校验的 %s。\n' "$REMOTE_ASSET_NAME"
-else
-  printf '附件：上传 %s 并校验。\n' "$APK_NAME"
-fi
+printf '附件：big-price-checker.apk（已存在：%s）与 update.json（已存在：%s）；缺失时上传，逐项校验。\n' \
+  "$APK_PRESENT" "$MANIFEST_PRESENT"
 if [[ "$KEEP_DRAFT" == true ]]; then
   printf '结果：保留草稿。\n'
 else
   printf '结果：发布为正式版，并设为 Latest。\n'
 fi
 if [[ "$DRY_RUN" == true ]]; then
-  printf '预览完成，未修改远程。\n'
+  printf '\n发布说明预览：\n'
+  cat "$NOTES"
+  printf '\nupdate.json 预览：\n'
+  cat "$MANIFEST"
+  printf '\n预览完成，未修改远程，也未修改本地发布说明或 update.json。\n'
   exit 0
 fi
+
+STAGE='保存本地发布文件'
+persist_manifest
+persist_notes
 
 if [[ -z "$RELEASE_ID" ]]; then
   STAGE='创建草稿'
@@ -254,25 +382,35 @@ STAGE='上传 APK'
 # Re-read before writing in case another process changed the draft after preflight.
 assert_draft
 verify_assets
-if [[ $ASSET_COUNT -eq 0 ]]; then
+if [[ "$APK_PRESENT" == false ]]; then
   REMOTE_TOUCHED=true
   gh release upload "$VERSION" "$APK" --repo "$REPO" || die 'APK 上传失败，草稿已保留。'
 fi
 
-STAGE='校验远程 APK'
+STAGE='上传更新文件'
 verify_assets
-[[ $ASSET_COUNT -eq 1 ]] || die '上传后没有找到 APK，草稿未发布。'
+if [[ "$MANIFEST_PRESENT" == false ]]; then
+  REMOTE_TOUCHED=true
+  gh release upload "$VERSION" "$MANIFEST" --repo "$REPO" || die 'update.json 上传失败，草稿已保留。'
+fi
+
+STAGE='校验远程 APK 和更新文件'
+verify_assets
+[[ $ASSET_COUNT -eq 2 && "$APK_PRESENT" == true && "$MANIFEST_PRESENT" == true ]] ||
+  die '上传后 APK 或 update.json 不完整，草稿未发布。'
 
 STAGE='更新发布说明'
 assert_draft
 REMOTE_TOUCHED=true
 api "repos/$REPO/releases/$RELEASE_ID" --method PATCH \
-  -f "name=$TITLE" -F "body=@$NOTES" -F prerelease=false --silent || die '更新草稿说明失败。'
+  -f "tag_name=$VERSION" -f "name=$TITLE" -F "body=@$NOTES" -F prerelease=false --silent || die '更新草稿说明失败。'
 
 if [[ "$KEEP_DRAFT" == false ]]; then
   STAGE='发布正式版'
+  # GitHub may reset a draft to an untagged-* placeholder when a PATCH omits
+  # tag_name. Pin it explicitly on every edit, including publication.
   api "repos/$REPO/releases/$RELEASE_ID" --method PATCH \
-    -F draft=false -F prerelease=false -f make_latest=true --silent || die '发布请求失败，请先检查远程是否已发布。'
+    -f "tag_name=$VERSION" -F draft=false -F prerelease=false -f make_latest=true --silent || die '发布请求失败，请先检查远程是否已发布。'
 fi
 
 STAGE='核验发布结果'
@@ -282,6 +420,7 @@ IFS=$'\t' read -r RELEASE_URL FINAL_DRAFT FINAL_PRERELEASE FINAL_TAG <<< "$FINAL
 [[ "$FINAL_DRAFT" == "$KEEP_DRAFT" && "$FINAL_PRERELEASE" == false && "$FINAL_TAG" == "$VERSION" ]] ||
   die '远程发布状态与请求不一致，请检查 Releases 页面。'
 verify_assets
-[[ $ASSET_COUNT -eq 1 && -n "$RELEASE_URL" && -n "$DOWNLOAD_URL" ]] || die '发布后附件或链接不完整。'
-printf '\n完成。\nRelease：%s\n附件：%s\n下载：%s\nSHA-256：%s\n' \
-  "$RELEASE_URL" "$REMOTE_ASSET_NAME" "$DOWNLOAD_URL" "$APK_SHA"
+[[ $ASSET_COUNT -eq 2 && "$APK_PRESENT" == true && "$MANIFEST_PRESENT" == true && -n "$RELEASE_URL" ]] ||
+  die '发布后附件或链接不完整。'
+printf '\n完成。\nRelease：%s\n附件：%s 和 update.json\n下载：%s\nSHA-256：%s\n更新文件：%s\n' \
+  "$RELEASE_URL" "$APK_NAME" "$DOWNLOAD_URL" "$APK_SHA" "$MANIFEST_URL"

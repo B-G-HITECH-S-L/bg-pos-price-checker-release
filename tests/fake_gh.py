@@ -37,16 +37,16 @@ def release_for_tag(tag):
 
 def asset_for_file(path):
     data = Path(path).read_bytes()
-    if state.get("corrupt_upload"):
+    if state.get("corrupt_upload") in (True, Path(path).name):
         data = data[:-1] + bytes([data[-1] ^ 1])
     return {
-        "id": 11,
-        "name": Path(path).name.replace(" ", "."),
+        "id": 12 if Path(path).name == "update.json" else 11,
+        "name": Path(path).name,
         "size": len(data),
         "state": "uploaded",
         "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
         "data": base64.b64encode(data).decode(),
-        "browser_download_url": "https://github.com/example/releases/download/v0.0.1/app.apk",
+        "browser_download_url": "https://github.com/B-G-HITECH-S-L/bg-pos-price-checker-release/releases/download/" + args[2] + "/" + Path(path).name,
     }
 
 
@@ -56,9 +56,10 @@ if args[:2] == ["auth", "status"]:
 if args[:2] == ["release", "upload"]:
     assert args[4:] == ["--repo", "B-G-HITECH-S-L/bg-pos-price-checker-release"]
     release = release_for_tag(args[2])
-    if state.get("upload_failure"):
+    if state.get("upload_failure") in (True, Path(args[3]).name):
         fail("simulated upload failure")
-    release["assets"].append(asset_for_file(args[3]))
+    if state.get("skip_upload") != Path(args[3]).name:
+        release["assets"].append(asset_for_file(args[3]))
     save()
     sys.exit(0)
 
@@ -113,6 +114,10 @@ elif path.startswith("/commits/"):
 elif path == "/releases" and method == "GET":
     if state.get("query_failure"):
         fail("simulated API failure")
+    if state.get("change_notes_during_preflight"):
+        Path(state["change_notes_during_preflight"]).write_text("a new handwritten note\n")
+    if state.get("change_manifest_during_preflight"):
+        Path(state["change_manifest_during_preflight"]).write_text("concurrent edit\n")
     tag = re.search(r'\.tag_name == "([^"]+)"', query).group(1)
     for release in state["releases"]:
         if release["tag_name"] == tag:
@@ -139,6 +144,10 @@ elif path.endswith("/assets"):
 elif path.startswith("/releases/"):
     release = next(item for item in state["releases"] if item["id"] == int(path.rsplit("/", 1)[1]))
     if method == "PATCH":
+        # Reproduce GitHub's draft edit behavior (cli/cli#5422): PATCHing a
+        # draft without tag_name can replace its tag with an untagged-* value.
+        if release["draft"] and "tag_name" not in fields:
+            release["tag_name"] = "untagged-test-placeholder"
         release.update(fields)
         save()
         if fields.get("draft") is False and state.get("publish_response_lost"):
