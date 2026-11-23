@@ -209,6 +209,10 @@ awk '
 ' "$WORK_DIR/package-info.md" "$WORK_DIR/notes-input.md" > "$NOTES" ||
   die '发布说明的自动区块标记不完整或重复，请先修复 release-package-info 标记。'
 
+STAGE='检查公开发布说明'
+python3 "$ROOT/scripts/validate-release-notes.py" "$NOTES" ||
+  die '发布说明包含禁止公开的信息，请按公开说明规范修正。'
+
 persist_notes() {
   # Do not overwrite edits made during network preflight, or a newly created file.
   if [[ "$NOTES_EXISTED" == true ]]; then

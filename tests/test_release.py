@@ -28,6 +28,7 @@ class ReleaseTests(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/release.sh", self.script)
         shutil.copy2(ROOT / "scripts/generate-update-manifest.py", self.root / "scripts/generate-update-manifest.py")
         shutil.copy2(ROOT / "scripts/sync-aio-catalog.py", self.root / "scripts/sync-aio-catalog.py")
+        shutil.copy2(ROOT / "scripts/validate-release-notes.py", self.root / "scripts/validate-release-notes.py")
         self.apk = self.version_dir / "big-price-checker.apk"
         with zipfile.ZipFile(self.apk, "w") as archive:
             archive.writestr("AndroidManifest.xml", b"fixture manifest")
@@ -120,6 +121,18 @@ class ReleaseTests(unittest.TestCase):
     def test_help(self):
         self.assert_success(self.run_release(version="--help"))
         self.assertEqual(self.calls(), [])
+
+    def test_sensitive_notes_stop_before_github_and_persistence(self):
+        original = "后台地址 https://example.invalid\n源码提交：abcdef1\n"
+        self.notes.write_text(original)
+        for flags in [(), ("--dry-run",), ("--draft",), ("--resume",)]:
+            with self.subTest(flags=flags):
+                result = self.run_release(*flags)
+                self.assert_failure(result, "发布说明包含禁止公开的信息")
+                self.assertNotIn("example.invalid", result.stdout + result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.notes.read_text(), original)
+                self.assertFalse((self.version_dir / "update.json").exists())
 
     def test_text_clipping_is_not_apk(self):
         self.apk.rename(self.version_dir / "app.apk.textClipping")
